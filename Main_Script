@@ -1,1 +1,368 @@
 
+// ==UserScript==
+// @name         TurtlUI
+// @namespace    https://github.com/octolet88/TurtlUI
+// @version      1.0.0
+// @description  Basic Hordes.io UI mod with menu, editable UI mode, and rigid 20-slot skillbar rows.
+// @match        *://hordes.io/*
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const STORAGE_KEYS = {
+    editableEnabled: 'turtlui.editable.enabled',
+    positions: 'turtlui.editable.positions'
+  };
+
+  const TARGET_SELECTORS = [
+    '#ui',
+    '#chat',
+    '#chatbox',
+    '#minimap',
+    '#party',
+    '#inventory',
+    '#quests',
+    '#skills',
+    '#stats',
+    '.ui-panel',
+    '.window',
+    '.panel',
+    '.box',
+    '.minimap',
+    '.chat',
+    '.skillbar',
+    '.actionbar',
+    '.action-bar',
+    '[id*="skillbar"]',
+    '[class*="skillbar"]'
+  ];
+
+  const SKILLBAR_SELECTORS = [
+    '#skillbar',
+    '.skillbar',
+    '.actionbar',
+    '.action-bar',
+    '[id*="skillbar"]',
+    '[class*="skillbar"]'
+  ];
+
+  let editableEnabled = readBool(STORAGE_KEYS.editableEnabled, false);
+  let savedPositions = readJSON(STORAGE_KEYS.positions, {});
+  let dragState = null;
+  let refreshQueued = false;
+
+  injectStyles();
+  const launcher = createLauncherButton();
+  const menu = createMenu();
+  mountUI(launcher, menu);
+  enforceSkillbarLayout(document);
+  refreshEditableTargets();
+  syncMenu();
+
+  const observer = new MutationObserver(() => {
+    if (refreshQueued) return;
+    refreshQueued = true;
+    requestAnimationFrame(() => {
+      refreshQueued = false;
+      enforceSkillbarLayout(document);
+      refreshEditableTargets();
+    });
+  });
+
+  if (document.body) {
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function injectStyles() {
+    const style = document.createElement('style');
+    style.id = 'turtlui-styles';
+    style.textContent = `
+      #turtlui-launcher {
+        position: fixed;
+        top: 130px;
+        right: 12px;
+        z-index: 99999;
+        width: 36px;
+        height: 36px;
+        border: 1px solid rgba(255,255,255,.35);
+        border-radius: 8px;
+        background: rgba(16,24,40,.85);
+        color: #86efac;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      #turtlui-menu {
+        position: fixed;
+        top: 174px;
+        right: 12px;
+        z-index: 99999;
+        width: 220px;
+        background: rgba(12,17,28,.92);
+        border: 1px solid rgba(255,255,255,.22);
+        border-radius: 10px;
+        color: #dbeafe;
+        font-family: Arial, sans-serif;
+        font-size: 13px;
+        padding: 10px;
+        box-sizing: border-box;
+      }
+
+      #turtlui-menu.hidden { display: none; }
+      #turtlui-menu h3 {
+        margin: 0 0 8px;
+        font-size: 14px;
+        color: #86efac;
+      }
+      #turtlui-menu button {
+        width: 100%;
+        border: 1px solid rgba(255,255,255,.3);
+        border-radius: 8px;
+        background: rgba(30,41,59,.9);
+        color: #e2e8f0;
+        padding: 7px 8px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      #turtlui-menu .status {
+        margin-top: 8px;
+        color: #93c5fd;
+      }
+
+      .turtlui-editable {
+        outline: 2px dashed #facc15 !important;
+        cursor: move !important;
+      }
+
+      .turtlui-rigid-skillbar {
+        display: grid !important;
+        grid-template-columns: repeat(20, minmax(0, 1fr)) !important;
+        grid-auto-flow: row !important;
+        gap: 2px !important;
+      }
+
+      .turtlui-rigid-skillbar > * {
+        min-width: 0 !important;
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  function createLauncherButton() {
+    const button = document.createElement('button');
+    button.id = 'turtlui-launcher';
+    button.type = 'button';
+    button.title = 'Open TurtlUI';
+    button.textContent = '🐢';
+    button.addEventListener('click', () => {
+      menu.classList.toggle('hidden');
+    });
+    return button;
+  }
+
+  function createMenu() {
+    const wrapper = document.createElement('div');
+    wrapper.id = 'turtlui-menu';
+    wrapper.classList.add('hidden');
+    wrapper.innerHTML = `
+      <h3>TurtlUI v1.0</h3>
+      <button id="turtlui-toggle-edit" type="button"></button>
+      <div class="status" id="turtlui-edit-status"></div>
+    `;
+
+    const toggleButton = wrapper.querySelector('#turtlui-toggle-edit');
+    toggleButton.addEventListener('click', () => {
+      editableEnabled = !editableEnabled;
+      localStorage.setItem(STORAGE_KEYS.editableEnabled, String(editableEnabled));
+      refreshEditableTargets();
+      syncMenu();
+    });
+
+    return wrapper;
+  }
+
+  function mountUI(button, panel) {
+    const container = resolveAnchorContainer();
+    container.appendChild(button);
+    container.appendChild(panel);
+  }
+
+  function resolveAnchorContainer() {
+    const candidates = [
+      '#ui',
+      '#game',
+      '#hud',
+      '.hud',
+      '.game-ui',
+      'body'
+    ];
+
+    for (const selector of candidates) {
+      const node = document.querySelector(selector);
+      if (node) return node;
+    }
+
+    return document.body;
+  }
+
+  function syncMenu() {
+    const toggleButton = document.querySelector('#turtlui-toggle-edit');
+    const status = document.querySelector('#turtlui-edit-status');
+    if (!toggleButton || !status) return;
+
+    toggleButton.textContent = editableEnabled ? 'Disable UI Editing' : 'Enable UI Editing';
+    status.textContent = editableEnabled ? 'Editing: ON' : 'Editing: OFF';
+  }
+
+  function refreshEditableTargets() {
+    const elements = getEditableElements();
+    for (const el of elements) {
+      bindEditableElement(el);
+      applySavedPosition(el);
+      el.classList.toggle('turtlui-editable', editableEnabled);
+    }
+  }
+
+  function getEditableElements() {
+    const uniq = new Set();
+    for (const selector of TARGET_SELECTORS) {
+      document.querySelectorAll(selector).forEach((el) => {
+        if (isProtectedNode(el)) return;
+        uniq.add(el);
+      });
+    }
+    return Array.from(uniq);
+  }
+
+  function bindEditableElement(el) {
+    if (el.dataset.turtluiBound === 'true') return;
+    el.dataset.turtluiBound = 'true';
+    el.addEventListener('mousedown', onEditableMouseDown);
+  }
+
+  function isProtectedNode(node) {
+    return Boolean(node.closest('#turtlui-menu') || node.closest('#turtlui-launcher'));
+  }
+
+  function onEditableMouseDown(event) {
+    if (!editableEnabled || event.button !== 0) return;
+    if (isProtectedNode(event.target)) return;
+
+    const target = event.currentTarget;
+    const rect = target.getBoundingClientRect();
+    const style = getComputedStyle(target);
+    if (style.position !== 'fixed' && style.position !== 'absolute') {
+      target.style.position = 'fixed';
+    }
+
+    target.style.left = `${rect.left}px`;
+    target.style.top = `${rect.top}px`;
+    target.style.right = 'auto';
+    target.style.bottom = 'auto';
+    target.style.margin = '0';
+    target.style.zIndex = '99998';
+
+    dragState = {
+      target,
+      dx: event.clientX - rect.left,
+      dy: event.clientY - rect.top
+    };
+
+    document.addEventListener('mousemove', onEditableMouseMove);
+    document.addEventListener('mouseup', onEditableMouseUp, { once: true });
+    event.preventDefault();
+  }
+
+  function onEditableMouseMove(event) {
+    if (!dragState) return;
+    const x = Math.max(0, event.clientX - dragState.dx);
+    const y = Math.max(0, event.clientY - dragState.dy);
+    dragState.target.style.left = `${x}px`;
+    dragState.target.style.top = `${y}px`;
+  }
+
+  function onEditableMouseUp() {
+    if (!dragState) return;
+    const target = dragState.target;
+    const key = getNodeKey(target);
+    if (key) {
+      savedPositions[key] = {
+        left: target.style.left,
+        top: target.style.top
+      };
+      localStorage.setItem(STORAGE_KEYS.positions, JSON.stringify(savedPositions));
+    }
+
+    document.removeEventListener('mousemove', onEditableMouseMove);
+    dragState = null;
+  }
+
+  function applySavedPosition(el) {
+    const key = getNodeKey(el);
+    if (!key || !savedPositions[key]) return;
+
+    const position = savedPositions[key];
+    if (!position.left || !position.top) return;
+
+    el.style.position = 'fixed';
+    el.style.left = position.left;
+    el.style.top = position.top;
+    el.style.right = 'auto';
+    el.style.bottom = 'auto';
+    el.style.margin = '0';
+  }
+
+  function getNodeKey(node) {
+    if (!node || node === document.body || node === document.documentElement) return '';
+    if (node.id) return `#${node.id}`;
+
+    const parts = [];
+    let current = node;
+    while (current && current.nodeType === 1 && current !== document.body) {
+      let segment = current.tagName.toLowerCase();
+      if (current.classList.length) {
+        segment += `.${Array.from(current.classList).slice(0, 2).join('.')}`;
+      }
+      const siblings = Array.from(current.parentElement ? current.parentElement.children : []);
+      const index = siblings.indexOf(current);
+      segment += `:nth-child(${index + 1})`;
+      parts.unshift(segment);
+      current = current.parentElement;
+      if (parts.length >= 6) break;
+    }
+    return parts.join('>');
+  }
+
+  function enforceSkillbarLayout(root) {
+    const bars = new Set();
+
+    for (const selector of SKILLBAR_SELECTORS) {
+      root.querySelectorAll(selector).forEach((node) => bars.add(node));
+    }
+
+    for (const bar of bars) {
+      const slotCount = bar.children.length;
+      if (!slotCount) continue;
+      bar.classList.add('turtlui-rigid-skillbar');
+    }
+  }
+
+  function readJSON(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function readBool(key, fallback) {
+    const value = localStorage.getItem(key);
+    if (value === null) return fallback;
+    return value === 'true';
+  }
+})();
